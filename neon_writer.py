@@ -153,7 +153,23 @@ def _get_pool():
         # waiting on a database that is merely a nice-to-have. The test
         # suite turns this right down for the outage test.
         timeout = float(os.environ.get("NEON_POOL_TIMEOUT", "10"))
-        pool = ConnectionPool(url, min_size=1, max_size=4, timeout=timeout, open=False)
+        # Neon autosuspends an idle compute after ~5 minutes. min_size=1
+        # keeps one connection open indefinitely, and psycopg_pool does no
+        # liveness check by default -- so without `check`, that connection
+        # goes dead across run_daily's 60s cooldown or scrape_orders'
+        # minutes of Playwright work between upserts, and the next write
+        # raises (swallowed by @_guard, silently dropping a whole
+        # StatusBatchWriter flush). check_connection makes the pool
+        # actively probe and replace a dead connection before handing it
+        # out.
+        pool = ConnectionPool(
+            url,
+            min_size=1,
+            max_size=4,
+            timeout=timeout,
+            open=False,
+            check=ConnectionPool.check_connection,
+        )
         pool.open()
         _pool = pool
         return _pool
@@ -278,7 +294,7 @@ class StatusUpdate(NamedTuple):
 
 _STATUS_SQL = """
 UPDATE unifi_orders SET
-    status             = %(status)s,
+    status             = coalesce(%(status)s, status),
     status_latest_date = coalesce(%(status_latest_date)s, status_latest_date),
     status_scrape_date = %(scraped_at)s,
     cust_id            = coalesce(%(new_cust_id)s, cust_id),
