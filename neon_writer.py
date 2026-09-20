@@ -359,3 +359,60 @@ def update_cust_ids(updates) -> int:
         with conn.cursor() as cur:
             cur.executemany(_CUST_ID_SQL, params)
     return len(params)
+
+
+def start_run(month_text, year, scrape_mode, triggered_by, job_id=None):
+    """Open a scrape-run row and tag subsequent events with it.
+
+    Returns the run id, or None when Neon is not configured or the
+    insert failed. The caller passes that value straight back to
+    finish_run(), which accepts None.
+    """
+    global _current_run_id, _failures
+    try:
+        pool = _get_pool()
+        if pool is None:
+            return None
+        with pool.connection() as conn:
+            run_id = conn.execute(
+                "INSERT INTO unifi_scrape_runs"
+                " (job_id, month_text, year, scrape_mode, triggered_by, status)"
+                " VALUES (%s, %s, %s, %s, %s, 'running') RETURNING id",
+                (job_id, month_text, year, scrape_mode, triggered_by),
+            ).fetchone()[0]
+        _current_run_id = run_id
+        return run_id
+    except Exception as exc:
+        _failures += 1
+        print(f"⚠️  neon: start_run failed: {exc}")
+        return None
+
+
+@_guard
+def finish_run(run_id, status, counts=None, error=None):
+    """Close a scrape-run row and stop tagging events with it."""
+    global _current_run_id
+    _current_run_id = None
+    if run_id is None:
+        return 0
+    pool = _get_pool()
+    if pool is None:
+        return 0
+    counts = counts or {}
+    with pool.connection() as conn:
+        conn.execute(
+            "UPDATE unifi_scrape_runs SET"
+            "   status = %s, finished_at = now(), orders_processed = %s,"
+            "   successful = %s, skipped = %s, failed = %s, error = %s"
+            " WHERE id = %s",
+            (
+                status,
+                counts.get("orders_processed"),
+                counts.get("successful"),
+                counts.get("skipped"),
+                counts.get("failed"),
+                error,
+                run_id,
+            ),
+        )
+    return 1

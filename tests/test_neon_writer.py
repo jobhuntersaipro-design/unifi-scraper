@@ -181,3 +181,77 @@ def test_status_updates_of_an_empty_list_is_a_no_op(writer):
     assert writer.update_order_statuses([]) == 0
     assert writer.update_cust_ids([]) == 0
     assert writer.write_failure_count() == 0
+
+
+def test_start_run_returns_an_id_and_marks_it_running(writer, db):
+    run_id = writer.start_run("Sep", 2026, "incremental", "cron")
+    assert isinstance(run_id, int)
+    row = db.execute(
+        "SELECT month_text, year, scrape_mode, triggered_by, status"
+        "  FROM unifi_scrape_runs WHERE id = %s",
+        (run_id,),
+    ).fetchone()
+    assert row == ("Sep", 2026, "incremental", "cron", "running")
+
+
+def test_finish_run_records_the_counts(writer, db):
+    run_id = writer.start_run("Sep", 2026, "incremental", "cron")
+    writer.finish_run(
+        run_id, "done",
+        counts={"orders_processed": 412, "successful": 409, "skipped": 0, "failed": 3},
+    )
+    row = db.execute(
+        "SELECT status, orders_processed, failed, finished_at IS NOT NULL"
+        "  FROM unifi_scrape_runs WHERE id = %s",
+        (run_id,),
+    ).fetchone()
+    assert row == ("done", 412, 3, True)
+
+
+def test_finish_run_records_an_error(writer, db):
+    run_id = writer.start_run("Sep", 2026, "full", "cron")
+    writer.finish_run(run_id, "error", error="login timed out")
+    row = db.execute(
+        "SELECT status, error FROM unifi_scrape_runs WHERE id = %s", (run_id,)
+    ).fetchone()
+    assert row == ("error", "login timed out")
+
+
+def test_events_written_during_a_run_carry_its_id(writer, db):
+    run_id = writer.start_run("Sep", 2026, "incremental", "cron")
+    writer.upsert_orders([_row("O1")])
+    got = db.execute(
+        "SELECT scrape_run_id FROM unifi_order_status_events WHERE order_number = 'O1'"
+    ).fetchone()[0]
+    assert got == run_id
+    writer.finish_run(run_id, "done")
+
+
+def test_events_written_outside_a_run_have_no_id(writer, db):
+    writer.upsert_orders([_row("O1")])
+    got = db.execute(
+        "SELECT scrape_run_id FROM unifi_order_status_events WHERE order_number = 'O1'"
+    ).fetchone()[0]
+    assert got is None
+
+
+def test_finish_run_clears_the_current_run(writer, db):
+    run_id = writer.start_run("Sep", 2026, "incremental", "cron")
+    writer.finish_run(run_id, "done")
+    writer.upsert_orders([_row("O2")])
+    got = db.execute(
+        "SELECT scrape_run_id FROM unifi_order_status_events WHERE order_number = 'O2'"
+    ).fetchone()[0]
+    assert got is None
+
+
+def test_start_run_without_a_database_returns_none(monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    neon_writer.close()
+    neon_writer.reset_failures()
+    try:
+        assert neon_writer.start_run("Sep", 2026, "incremental", "cron") is None
+        neon_writer.finish_run(None, "done")     # must not raise
+        assert neon_writer.write_failure_count() == 0
+    finally:
+        neon_writer.close()
