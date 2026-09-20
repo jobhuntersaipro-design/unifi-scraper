@@ -12,6 +12,8 @@ from typing import Dict, List, Tuple
 from playwright.async_api import Page
 
 from gsheets_writer import month_tab_title, open_sheet
+import neon_writer
+from neon_writer import StatusUpdate
 
 try:
     from zoneinfo import ZoneInfo
@@ -77,7 +79,7 @@ def parse_ic_number(ic_field: str) -> Tuple[str, str]:
     return "", ""
 
 
-def get_orders_to_check(ws, only_empty: bool = False) -> Tuple[List[Dict], List[int]]:
+def get_orders_to_check(ws, only_empty: bool = False) -> Tuple[List[Dict], List[Tuple[int, str]]]:
     """
     Read all orders from the worksheet that need status checking.
     Uses custId for direct qrySubsPageTree queries (no Advanced Query needed).
@@ -131,7 +133,10 @@ def get_orders_to_check(ws, only_empty: bool = False) -> Tuple[List[Dict], List[
             if idx_order_status != -1:
                 if row[idx_order_status].strip().lower() == "cancelled":
                     if idx_status != -1 and not row[idx_status].strip():
-                        cancelled_rows.append(row_num)
+                        # Carries the order number so the "-" write can
+                        # be mirrored to Neon, which is keyed by order
+                        # number rather than by sheet row.
+                        cancelled_rows.append((row_num, order_number))
                     continue
 
             # Skip orders that already have a Status if only_empty mode
@@ -699,14 +704,17 @@ class StatusBatchWriter:
         except ValueError:
             self.cust_id_col = -1
 
-    def add(self, row_index: int, status: str, status_date: str = "", new_cust_id: str = ""):
+    def add(self, row_index: int, order_number: str, status: str,
+            status_date: str = "", new_cust_id: str = ""):
         if self.status_col == -1:
             print("    Status column not found in headers")
             return
         if not status:
             status = "-"
         timestamp = "'" + datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
-        self.pending.append((row_index, status, status_date, timestamp, new_cust_id))
+        self.pending.append(
+            (row_index, order_number, status, status_date, timestamp, new_cust_id)
+        )
         if len(self.pending) >= self.batch_size:
             self.flush()
 
@@ -717,7 +725,7 @@ class StatusBatchWriter:
         from gspread.utils import rowcol_to_a1
 
         batch = []
-        for row_index, status, status_date, timestamp, new_cust_id in self.pending:
+        for row_index, _order_number, status, status_date, timestamp, new_cust_id in self.pending:
             batch.append({"range": rowcol_to_a1(row_index, self.status_col), "values": [[status]]})
             if self.date_col != -1:
                 batch.append({"range": rowcol_to_a1(row_index, self.date_col), "values": [[status_date]]})
@@ -734,6 +742,20 @@ class StatusBatchWriter:
             if err_msg not in self.write_errors:
                 self.write_errors.append(err_msg)
             print(f"    Batch write error ({len(self.pending)} rows): {e}")
+            self.pending = []
+            return
+
+        # Sheets is authoritative and it accepted the batch, so mirror
+        # the same rows into Neon. Anything without an order number is
+        # skipped: the sheet is keyed by row index, Neon is not.
+        neon_writer.update_order_statuses(
+            [
+                StatusUpdate(order_number, status, status_date, new_cust_id)
+                for _row_index, order_number, status, status_date, _timestamp, new_cust_id
+                in self.pending
+                if order_number
+            ]
+        )
 
         self.pending = []
 
@@ -946,8 +968,8 @@ async def check_all_statuses(
     # Fill cancelled orders with "-" immediately
     if cancelled_rows:
         print(f"  Writing '-' for {len(cancelled_rows)} cancelled orders...")
-        for row_idx in cancelled_rows:
-            writer.add(row_idx, "-")
+        for row_idx, order_number in cancelled_rows:
+            writer.add(row_idx, order_number, "-")
         writer.flush()
         print(f"  Done marking cancelled orders")
 
@@ -1220,7 +1242,7 @@ async def check_all_statuses(
                 print(f"    {order['order_number']} -> {display_status} ({status_date})")
                 if order_updated_cust_id:
                     print(f"    Cust ID updated: {cust_id} -> {order_updated_cust_id}")
-                writer.add(order["row_index"], status, status_date, new_cust_id=order_updated_cust_id)
+                writer.add(order["row_index"], order["order_number"], status, status_date, new_cust_id=order_updated_cust_id)
 
                 if status == "Not Found":
                     not_found += 1
