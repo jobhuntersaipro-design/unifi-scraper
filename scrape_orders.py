@@ -13,12 +13,12 @@ from playwright.async_api import Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from date_utils import month_range_yyyymmddhhmmss, standardize_date
+import writers
 from gsheets_writer import (
     ensure_tab,
     ensure_tabs_sorted_by_month,
     month_tab_title,
     open_sheet,
-    upsert_rows,
 )
 from login_manager import login_and_get_context
 
@@ -1118,7 +1118,7 @@ async def scrape_orders_month(
                                 row_data["Order Number"] = f"'{order_id}"
 
                                 # CRASH-SAFE: Save immediately after each successful scrape
-                                upsert_rows(ws, [row_data])
+                                writers.upsert_order(ws, row_data)
 
                                 # Update our tracking
                                 complete_orders[order_id] = datetime.now(LOCAL_TZ)
