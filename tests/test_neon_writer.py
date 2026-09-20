@@ -255,3 +255,22 @@ def test_start_run_without_a_database_returns_none(monkeypatch):
         assert neon_writer.write_failure_count() == 0
     finally:
         neon_writer.close()
+
+
+def test_backfilling_twice_writes_no_second_event(writer, db):
+    # First pass: one INSERT event per order, prev_status NULL. That is
+    # what the portal renders as "State at migration".
+    rows = [_row(f"O{i}", **{"Status": "Active"}) for i in range(20)]
+    writer.upsert_orders(rows)
+    after_first = db.execute("SELECT count(*) FROM unifi_order_status_events").fetchone()[0]
+    assert after_first == 20
+
+    # Second pass is an UPDATE the trigger guard suppresses.
+    writer.upsert_orders(rows)
+    after_second = db.execute("SELECT count(*) FROM unifi_order_status_events").fetchone()[0]
+    assert after_second == 20
+
+    prev_statuses = db.execute(
+        "SELECT DISTINCT prev_status FROM unifi_order_status_events"
+    ).fetchall()
+    assert prev_statuses == [(None,)]
