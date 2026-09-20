@@ -45,15 +45,29 @@ def status_text(value):
     return None if cleaned == "-" else cleaned
 
 
+_RANGE_SEP = " - "  # space-hyphen-space: scrape_orders.py builds appointment
+# ranges as f"{format_datetime(appt_start)} - {format_datetime(appt_end)}".
+# Splitting on this exact three-character token (not a bare "-") is what
+# keeps it from colliding with the hyphens inside "%Y-%m-%d", which are
+# never surrounded by spaces.
+
+
 def parse_dt(value):
     """Parse any date the scraper writes into an aware datetime.
 
     Returns None for blanks and for anything unrecognised -- a garbage
     cell must not kill a scrape.
+
+    Appointment cells can hold a range ("start - end", built by
+    scrape_orders.py when both an appointment start and end are known).
+    When one is seen, only the start is parsed; the full range text is
+    still preserved in coerce_row's `raw` column.
     """
     cleaned = text(value)
     if not cleaned:
         return None
+    if _RANGE_SEP in cleaned:
+        cleaned = cleaned.split(_RANGE_SEP, 1)[0].strip()
     for fmt in _DATE_FORMATS:
         try:
             return datetime.strptime(cleaned, fmt).replace(tzinfo=LOCAL_TZ)

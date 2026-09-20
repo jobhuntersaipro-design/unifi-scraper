@@ -41,6 +41,39 @@ def test_parse_dt_returns_none_rather_than_raising(raw):
     assert parse_dt(raw) is None
 
 
+def test_parse_dt_hyphenated_datetime_not_mangled_by_range_split():
+    # Regression guard: "%Y-%m-%d %H:%M:%S" contains bare hyphens with no
+    # surrounding spaces. The range splitter must only ever trigger on the
+    # literal " - " (space-hyphen-space) token the scraper emits between
+    # an appointment start and end, never on a hyphen inside a single
+    # datetime. Write this test first and confirm it passes both before
+    # and after the range-splitting change.
+    got = parse_dt("2026-09-20 14:30:00")
+    assert got == datetime(2026, 9, 20, 14, 30, 0).replace(tzinfo=LOCAL_TZ)
+
+
+def test_parse_dt_handles_an_appointment_range_by_taking_the_start():
+    # scrape_orders.py:1047-1048 builds this exact shape when both an
+    # appointment start and end are known:
+    #   f"{format_datetime(appt_start)} - {format_datetime(appt_end)}"
+    # That is the common case for a scheduled install, not an edge case.
+    # The full range text is preserved separately in coerce_row's `raw`.
+    got = parse_dt("22 Oct 2025 09:30 - 22 Oct 2025 11:30")
+    assert got == datetime(2025, 10, 22, 9, 30).replace(tzinfo=LOCAL_TZ)
+
+
+def test_parse_dt_handles_a_same_day_range_with_only_the_end_time_differing():
+    got = parse_dt("22 Oct 2025 09:30 - 22 Oct 2025 17:45")
+    assert got == datetime(2025, 10, 22, 9, 30).replace(tzinfo=LOCAL_TZ)
+
+
+def test_parse_dt_still_handles_a_bare_single_datetime_from_the_elif_branch():
+    # scrape_orders.py:1049's `elif appt_start:` branch emits a plain
+    # format_datetime(appt_start) with no range at all.
+    got = parse_dt("22 Oct 2025 09:30")
+    assert got == datetime(2025, 10, 22, 9, 30).replace(tzinfo=LOCAL_TZ)
+
+
 def test_text_strips_the_sheet_apostrophe():
     # Order numbers are written as "'12345" so Sheets treats them as
     # text instead of rendering 1.2345e4.
@@ -59,6 +92,16 @@ def test_status_text_maps_the_cancelled_sentinel_to_none():
     assert status_text("-") is None
     assert status_text("Active") == "Active"
     assert status_text("") is None
+
+
+def test_status_text_treats_whitespace_padded_sentinel_as_cancelled():
+    # " - " trims down to the same "-" sentinel.
+    assert status_text(" - ") is None
+
+
+def test_status_text_does_not_treat_double_hyphen_as_the_sentinel():
+    # "--" is not the sentinel and must survive as a literal status.
+    assert status_text("--") == "--"
 
 
 def test_coerce_row_maps_every_sheet_header():
@@ -88,13 +131,33 @@ def test_coerce_row_maps_every_sheet_header():
     }
     got = coerce_row(row)
 
+    # All 21 mapped columns, asserted against real expected values -- not
+    # just "is not None" -- so a typo in _FIELD_MAP's header string (which
+    # would otherwise silently and permanently NULL that column, since
+    # row.get() returns None for a missing key) makes a test fail.
     assert got["order_number"] == "1234567890"
+    assert got["event_type"] == "New Install"
+    assert got["order_status"] == "Completed"
+    assert got["created_date"] == parse_dt("22 Oct 2025 09:30")
+    assert got["updated_date"] == parse_dt("23 Oct 2025 11:00")
+    assert got["org_code"] == "RV10551"
+    assert got["organization_name"] == "Rover 10551"
     assert got["customer_name"] == "Ali bin Abu"      # "Name" -> customer_name
     assert got["company_name"] is None                # blank -> NULL
-    assert got["org_code"] == "RV10551"
+    assert got["email"] == "ali@example.com"
+    assert got["phone_number"] == "0123456789"
+    assert got["appointment_date"] == parse_dt("25 Oct 2025 14:00")
+    assert got["address"] == "12 Jalan Satu"
+    assert got["package"] == "UNI5G Postpaid 99"
+    assert got["device"] == "Modem X"
+    assert got["ic_number"] == "900101015555 (MyKad)"
+    assert got["creator"] == "Siti (S123)"
+    assert got["cust_id"] == "10555"
     assert got["status"] == "Active"
-    assert got["created_date"] == parse_dt("22 Oct 2025 09:30")
     assert got["status_latest_date"] == parse_dt("22 Oct 2025")
+    assert got["status_scrape_date"] == parse_dt("2026-09-20 14:30:00")
+
+    assert got["last_synced"] == parse_dt("2026-09-20 14:30:00")
     assert got["raw"] == row                          # plain dict, wrapped later
 
 
