@@ -157,3 +157,37 @@ def test_channel_breakdown_collapses_unmapped_codes_despite_label_drift(db):
         " WHERE org_code = 'RV99999'"
     ).fetchall()
     assert rows == [("RV99999", 2)]
+
+
+def test_monthly_stats_buckets_by_malaysian_time_regardless_of_reader_tz(db):
+    # An order created at 2026-10-01 07:00+08 is still September 30th in
+    # UTC. date_trunc('month', timestamptz) resolves against the READING
+    # session's TimeZone GUC, so a portal session that never sets one
+    # (Neon defaults to UTC) would bucket this order into September while
+    # the Telegram message -- built server-side in Asia/Kuala_Lumpur --
+    # counts it as October. The view must bucket in Malaysian time no
+    # matter what the reader's session TimeZone is.
+    db.execute(
+        "INSERT INTO unifi_orders (order_number, order_status, created_date)"
+        " VALUES ('O1', 'In Progress', '2026-10-01 07:00+08')"
+    )
+    # Force the reading session to UTC. `SET TimeZone = %s` is a syntax
+    # error -- the value cannot be parameterised -- so set_config() is
+    # used instead.
+    db.execute("SELECT set_config('TimeZone', 'UTC', false)")
+    row = db.execute("SELECT month FROM unifi_monthly_stats WHERE total = 1").fetchone()
+    assert row[0].month == 10
+    assert row[0].year == 2026
+
+
+def test_monthly_channel_breakdown_buckets_by_malaysian_time_regardless_of_reader_tz(db):
+    db.execute(
+        "INSERT INTO unifi_orders (order_number, org_code, order_status, created_date)"
+        " VALUES ('O1', 'RV99999', 'In Progress', '2026-10-01 07:00+08')"
+    )
+    db.execute("SELECT set_config('TimeZone', 'UTC', false)")
+    row = db.execute(
+        "SELECT month FROM unifi_monthly_channel_breakdown WHERE org_code = 'RV99999'"
+    ).fetchone()
+    assert row[0].month == 10
+    assert row[0].year == 2026

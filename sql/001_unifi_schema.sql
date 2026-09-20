@@ -1,4 +1,4 @@
--- schema-checksum: be736dde6df4098ed9e023235fe97ef5ae09ead9d07576b7d44fa442928951c9
+-- schema-checksum: 10cfe287cdb59e178e9082a19c898d81f6d7cc4b485136a16dd39f1ae15a456f
 -- Canonical DDL for the Unifi scraper's Neon tables.
 --
 -- THIS FILE IS THE SOURCE OF TRUTH. The portal repo
@@ -184,9 +184,19 @@ WINDOW w AS (PARTITION BY e.order_number ORDER BY e.changed_at, e.id);
 --   completed = lower(order_status) = 'completed'   (exact)
 --   cancelled = order_status ~* 'cancel|void|failed' (substring)
 --   other     = everything else, INCLUDING NULL
+--
+-- date_trunc() on a timestamptz resolves against the READING session's
+-- TimeZone GUC, not a fixed zone. Neon defaults new sessions to UTC and
+-- the portal (Prisma) sets none, so without the explicit AT TIME ZONE
+-- below, every order created between 00:00 and 08:00 Malaysian time on
+-- the 1st of a month would be bucketed into the PREVIOUS month by the
+-- portal while the Telegram message (built server-side in
+-- Asia/Kuala_Lumpur) counts it correctly -- the two would disagree.
+-- `AT TIME ZONE` on a timestamptz yields a plain timestamp, which is
+-- exactly what makes the bucket deterministic regardless of who reads it.
 CREATE OR REPLACE VIEW unifi_monthly_stats AS
 SELECT
-    date_trunc('month', created_date) AS month,
+    date_trunc('month', created_date AT TIME ZONE 'Asia/Kuala_Lumpur') AS month,
     count(*) AS total,
     count(*) FILTER (
         WHERE lower(coalesce(order_status, '')) = 'completed'
@@ -209,7 +219,7 @@ GROUP BY 1;
 -- max(...) collapses whichever variant the label expression turns up.
 CREATE OR REPLACE VIEW unifi_monthly_channel_breakdown AS
 SELECT
-    date_trunc('month', o.created_date) AS month,
+    date_trunc('month', o.created_date AT TIME ZONE 'Asia/Kuala_Lumpur') AS month,
     o.org_code,
     max(coalesce(c.display_name, nullif(o.organization_name, ''), nullif(o.org_code, ''))) AS channel_display_name,
     count(*) AS total,
@@ -230,9 +240,9 @@ GROUP BY 1, 2;
 CREATE OR REPLACE VIEW unifi_unmapped_channels AS
 SELECT
     o.org_code,
-    max(o.organization_name) AS organization_name,
-    count(*)                 AS order_count,
-    max(o.created_date)      AS latest_order_date
+    max(nullif(o.organization_name, '')) AS organization_name,
+    count(*)                             AS order_count,
+    max(o.created_date)                  AS latest_order_date
 FROM unifi_orders o
 LEFT JOIN unifi_channels c ON c.channel_code = o.org_code
 WHERE o.org_code IS NOT NULL
