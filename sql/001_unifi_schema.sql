@@ -152,3 +152,84 @@ CREATE TRIGGER unifi_orders_status_change
     AFTER INSERT OR UPDATE ON unifi_orders
     FOR EACH ROW
     EXECUTE FUNCTION unifi_log_order_status_change();
+
+-- One row per observed transition, with the channel label resolved and
+-- how long each state held. `previous_held_for` is what the portal's
+-- feed prints beside a transition; `held_for` is NULL while a state is
+-- still the current one.
+CREATE OR REPLACE VIEW unifi_order_status_timeline AS
+SELECT
+    e.id,
+    e.order_number,
+    e.changed_at,
+    e.prev_order_status,
+    e.order_status,
+    e.prev_status,
+    e.status,
+    e.status_latest_date,
+    e.cust_id,
+    e.scrape_run_id,
+    o.org_code,
+    coalesce(c.display_name, o.organization_name, o.org_code) AS channel_display_name,
+    e.changed_at - lag(e.changed_at) OVER w  AS previous_held_for,
+    lead(e.changed_at) OVER w - e.changed_at AS held_for
+FROM unifi_order_status_events e
+LEFT JOIN unifi_orders   o ON o.order_number  = e.order_number
+LEFT JOIN unifi_channels c ON c.channel_code  = o.org_code
+WINDOW w AS (PARTITION BY e.order_number ORDER BY e.changed_at, e.id);
+
+-- Definitions copied verbatim from the spec so the portal's stat tiles
+-- and the Telegram message can never disagree:
+--   completed = lower(order_status) = 'completed'   (exact)
+--   cancelled = order_status ~* 'cancel|void|failed' (substring)
+--   other     = everything else, INCLUDING NULL
+CREATE OR REPLACE VIEW unifi_monthly_stats AS
+SELECT
+    date_trunc('month', created_date) AS month,
+    count(*) AS total,
+    count(*) FILTER (
+        WHERE lower(coalesce(order_status, '')) = 'completed'
+    ) AS completed,
+    count(*) FILTER (
+        WHERE coalesce(order_status, '') ~* '(cancel|void|failed)'
+    ) AS cancelled,
+    count(*) FILTER (
+        WHERE lower(coalesce(order_status, '')) <> 'completed'
+          AND coalesce(order_status, '') !~* '(cancel|void|failed)'
+    ) AS other
+FROM unifi_orders
+WHERE created_date IS NOT NULL
+GROUP BY 1;
+
+CREATE OR REPLACE VIEW unifi_monthly_channel_breakdown AS
+SELECT
+    date_trunc('month', o.created_date) AS month,
+    o.org_code,
+    coalesce(c.display_name, o.organization_name, o.org_code) AS channel_display_name,
+    count(*) AS total,
+    count(*) FILTER (
+        WHERE lower(coalesce(o.order_status, '')) = 'completed'
+    ) AS completed,
+    count(*) FILTER (
+        WHERE coalesce(o.order_status, '') ~* '(cancel|void|failed)'
+    ) AS cancelled
+FROM unifi_orders o
+LEFT JOIN unifi_channels c ON c.channel_code = o.org_code
+WHERE o.created_date IS NOT NULL
+GROUP BY 1, 2, 3;
+
+-- Org codes that appear on orders but have no channel row. This is the
+-- queue that is invisible today: those orders print in Telegram as
+-- "RV10xxx | <Organization Name>" and nobody notices.
+CREATE OR REPLACE VIEW unifi_unmapped_channels AS
+SELECT
+    o.org_code,
+    max(o.organization_name) AS organization_name,
+    count(*)                 AS order_count,
+    max(o.created_date)      AS latest_order_date
+FROM unifi_orders o
+LEFT JOIN unifi_channels c ON c.channel_code = o.org_code
+WHERE o.org_code IS NOT NULL
+  AND o.org_code <> ''
+  AND c.channel_code IS NULL
+GROUP BY o.org_code;
