@@ -120,6 +120,23 @@ expression that can drift from a Python one.
 
 ### 5.2 The status trigger
 
+**The function is named `unifi_log_order_status_change()`, not
+`log_order_status_change()` as §4.3 of the parent spec has it.** The target
+database's `public` schema already contains `orders` and `order_status_events`
+tables belonging to the portal, and those almost certainly have a change-logging
+trigger of their own. Trigger functions in Postgres are scoped to the schema, not
+to the table, so `CREATE OR REPLACE FUNCTION log_order_status_change()` would
+either collide or — worse, because it fails silently — replace the portal's
+function with one that writes to the wrong table.
+
+The `unifi_` prefix therefore extends past table names to every database object
+this schema creates: the function, the trigger, the views and the role.
+
+**Before applying the SQL anywhere, verify the assumption:** list existing
+functions and triggers in `public` and confirm nothing of ours already exists
+under a different name. If the portal's trigger turns out to be named something
+that our file would clobber, the apply must stop.
+
 `AFTER INSERT OR UPDATE ON unifi_orders FOR EACH ROW`, with a guard that is the
 single most important line in this design:
 
@@ -322,13 +339,48 @@ Beyond the parent spec's criteria:
 
 ---
 
-## 10. Environment
+## 10. Environment and provisioning
+
+### 10.1 The target
+
+Confirmed 2026-09-20 from the Neon console:
+
+| | |
+|---|---|
+| Project | `wifibizz_bill_generator` |
+| Branch | `production` |
+| Database | `neondb` |
+| Schema | `public` |
+
+No `unifi_*` tables exist yet. The schema in this design is entirely new.
+
+The `public` schema currently holds 17 tables belonging to the portal, including
+`_prisma_migrations`, `orders`, `order_status_events`, `admin_audit_log` and
+`dealer_accounts`. Nothing we create may collide with any of them — see §5.2.
+
+### 10.2 Provisioning, in order
+
+Neither the role nor the tables exist, so this is the first work in the plan:
+
+1. Create a Neon **development branch** off `production`. All schema iteration
+   happens there. Applying hand-written DDL straight to a production branch that
+   Prisma believes it owns is how you find out what `prisma migrate dev` does when
+   it detects drift.
+2. Create the `unifi_scraper` role and apply `sql/001_unifi_schema.sql` on that
+   branch. Build and test everything against it.
+3. Apply to `production` **only once the portal's copy of the migration exists**
+   and can be registered with `prisma migrate resolve --applied` in the same
+   sitting. Between the apply and the resolve, the portal's migration state is
+   drifted, and anyone running `prisma migrate dev` in that window may be offered
+   a database reset. That window should be minutes, not days.
+
+### 10.3 Keys
 
 New key, added to a new `.env.example` alongside the two that already exist:
 
 ```
 # Neon — the scraper's own role, not the portal's connection string
-DATABASE_URL=postgresql://unifi_scraper:...@...neon.tech/...?sslmode=require
+DATABASE_URL=postgresql://unifi_scraper:...@...neon.tech/neondb?sslmode=require
 ```
 
 Note that `api_server.py` does not call `load_dotenv()` today, unlike the
@@ -358,8 +410,17 @@ Recorded here and folded back into `docs/bizzflow-admin-unifi-spec.md`:
    fire for a sync of any month.
 5. **Open question 1 is answered:** >2,000 orders/month, so the §5 pagination and
    index plan stands as written.
+6. **§4.3's trigger function name will collide.** It names the function
+   `log_order_status_change()`, but the target schema already has an
+   `order_status_events` table of the portal's own, and very likely a function by
+   that name behind it. Ours is `unifi_log_order_status_change()`. See §5.2.
+7. **§5's naming warning does not go far enough.** It warns that `/admin/orders`
+   already means something else. The same is true one layer down: `orders` and
+   `order_status_events` are existing tables in the same schema. The `unifi_`
+   prefix has to cover every database object, not just tables.
 
-Items 1–4 belong to the §8 work and are not fixed here.
+Items 1–4 belong to the §8 work and are not fixed here. Items 6–7 are fixed in
+this design.
 
 ---
 

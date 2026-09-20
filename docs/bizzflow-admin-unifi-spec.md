@@ -191,7 +191,7 @@ it in the "Unmapped" panel (§6.3) as work to do.
 Generate with `prisma migrate dev --create-only`, then add to the SQL file:
 
 - `unifi_channels.display_name` as `GENERATED ALWAYS AS (coalesce(nullif(fleet_label,''), nullif(plate,''), channel_name)) STORED` — the fallback chain enforced by the database, not by a TypeScript expression that can drift.
-- The `log_order_status_change()` trigger on `unifi_orders` (full body in the scraper repo's migration; `AFTER INSERT OR UPDATE ... FOR EACH ROW`). Putting it in the DB means `check_status.py`, the backfill scripts and any manual `UPDATE` all log correctly — the portal does not have to remember.
+- The `unifi_log_order_status_change()` trigger on `unifi_orders` (**renamed 2026-09-20** — `public` already contains the portal's own `order_status_events` table and, in all likelihood, a `log_order_status_change()` behind it. Trigger functions are schema-scoped, so the unprefixed name would collide with or silently replace it. Every object this schema creates carries the `unifi_` prefix, not just the tables.) (full body in the scraper repo's migration; `AFTER INSERT OR UPDATE ... FOR EACH ROW`). Putting it in the DB means `check_status.py`, the backfill scripts and any manual `UPDATE` all log correctly — the portal does not have to remember.
 - Views `unifi_order_status_timeline`, `unifi_monthly_stats`, `unifi_monthly_channel_breakdown`, `unifi_unmapped_channels`.
 
 Views are read via `prisma.$queryRaw` with a Zod-parsed row type (no `views`
