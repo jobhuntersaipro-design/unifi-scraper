@@ -9,8 +9,14 @@ The row dicts this module accepts are the same ones gsheets_writer takes
 that knows about the sheet's string formats.
 """
 
+import functools
+import os
+import threading
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
+from psycopg.types.json import Jsonb
+from psycopg_pool import ConnectionPool
 
 LOCAL_TZ = ZoneInfo("Asia/Kuala_Lumpur")
 
@@ -112,3 +118,146 @@ def coerce_row(row: dict) -> dict:
     out["last_synced"] = parse_dt(row.get("Last Synced")) or datetime.now(LOCAL_TZ)
     out["raw"] = row
     return out
+
+
+_pool = None
+_pool_lock = threading.Lock()
+_failures = 0
+_warned_no_url = False
+_current_run_id = None
+
+
+def _get_pool():
+    """The pool, or None when DATABASE_URL is unset.
+
+    run_daily.py runs each month's scrape as a SUBPROCESS, so this is
+    six short-lived pools in sequence rather than one long-lived pool.
+    min_size stays at 1 so we do not open connections that are thrown
+    away seconds later. Neon also closes idle connections, which is the
+    other reason this is a pool and not one long-lived connection.
+    """
+    global _pool, _warned_no_url
+    if _pool is not None:
+        return _pool
+    with _pool_lock:
+        if _pool is not None:
+            return _pool
+        url = os.environ.get("DATABASE_URL")
+        if not url:
+            if not _warned_no_url:
+                print("ℹ️  neon: DATABASE_URL unset — skipping Neon writes")
+                _warned_no_url = True
+            return None
+        # A scraper must not block for psycopg_pool's 30-second default
+        # waiting on a database that is merely a nice-to-have. The test
+        # suite turns this right down for the outage test.
+        timeout = float(os.environ.get("NEON_POOL_TIMEOUT", "10"))
+        pool = ConnectionPool(url, min_size=1, max_size=4, timeout=timeout, open=False)
+        pool.open()
+        _pool = pool
+        return _pool
+
+
+def close():
+    """Close the pool. Tests call this; so does a long-lived process on exit."""
+    global _pool
+    with _pool_lock:
+        if _pool is not None:
+            _pool.close()
+            _pool = None
+
+
+def write_failure_count() -> int:
+    return _failures
+
+
+def reset_failures():
+    global _failures
+    _failures = 0
+
+
+def _guard(fn):
+    """Catch, count, carry on. Nothing here may raise into a scrape."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        global _failures
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            _failures += 1
+            print(f"⚠️  neon: {fn.__name__} failed: {exc}")
+            return 0
+    return wrapper
+
+
+def _apply_run_id(conn):
+    """Tag whatever this connection writes with the current run.
+
+    The trigger reads `unifi.scrape_run_id` off the session, which is
+    how an event learns which scrape observed it without every INSERT
+    having to carry the id.
+    """
+    if _current_run_id is not None:
+        conn.execute(
+            "SELECT set_config('unifi.scrape_run_id', %s, true)",
+            (str(_current_run_id),),
+        )
+
+
+_ORDER_COLUMNS = (
+    "order_number", "event_type", "order_status", "created_date", "updated_date",
+    "org_code", "organization_name", "customer_name", "company_name", "email",
+    "phone_number", "appointment_date", "address", "package", "device",
+    "ic_number", "creator", "cust_id", "status", "status_latest_date",
+    "status_scrape_date", "last_synced", "raw",
+)
+
+# Columns a scrape always knows and may freely overwrite.
+_ALWAYS_UPDATE = (
+    "event_type", "order_status", "created_date", "updated_date", "org_code",
+    "organization_name", "customer_name", "company_name", "email",
+    "phone_number", "appointment_date", "address", "package", "device",
+    "ic_number", "creator", "last_synced", "raw",
+)
+
+# Columns only check_status and check_custid populate. A scrape that did
+# not look must not blank what a check found, so these coalesce.
+_COALESCE_UPDATE = ("cust_id", "status", "status_latest_date", "status_scrape_date")
+
+_UPSERT_SQL = (
+    "INSERT INTO unifi_orders (" + ", ".join(_ORDER_COLUMNS) + ") VALUES ("
+    + ", ".join(f"%({c})s" for c in _ORDER_COLUMNS)
+    + ") ON CONFLICT (order_number) DO UPDATE SET "
+    + ", ".join(f"{c} = EXCLUDED.{c}" for c in _ALWAYS_UPDATE)
+    + ", "
+    + ", ".join(
+        f"{c} = coalesce(EXCLUDED.{c}, unifi_orders.{c})" for c in _COALESCE_UPDATE
+    )
+)
+
+
+@_guard
+def upsert_orders(rows) -> int:
+    """Insert or update orders. Returns the number of rows sent."""
+    if not rows:
+        return 0
+    pool = _get_pool()
+    if pool is None:
+        return 0
+
+    params = []
+    for row in rows:
+        values = coerce_row(row)
+        if not values["order_number"]:
+            continue
+        values["raw"] = Jsonb(values["raw"])
+        params.append(values)
+
+    if not params:
+        return 0
+
+    with pool.connection() as conn:
+        _apply_run_id(conn)
+        with conn.cursor() as cur:
+            cur.executemany(_UPSERT_SQL, params)
+    return len(params)
