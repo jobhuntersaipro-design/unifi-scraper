@@ -85,3 +85,25 @@ def test_org_code_is_not_a_foreign_key(db):
         "SELECT org_code FROM unifi_orders WHERE order_number = 'ORD1'"
     ).fetchone()[0]
     assert got == "RV99999"
+
+
+def test_scrape_runs_round_trips(db):
+    run_id = db.execute(
+        "INSERT INTO unifi_scrape_runs (month_text, year, scrape_mode, triggered_by, status)"
+        " VALUES ('Sep', 2026, 'incremental', 'cron', 'running') RETURNING id"
+    ).fetchone()[0]
+    assert isinstance(run_id, int)
+
+    db.execute(
+        "UPDATE unifi_scrape_runs"
+        "   SET status = 'done', finished_at = now(), orders_processed = 412,"
+        "       successful = 409, skipped = 0, failed = 3"
+        " WHERE id = %s",
+        (run_id,),
+    )
+    row = db.execute(
+        "SELECT status, orders_processed, failed, started_at IS NOT NULL"
+        "  FROM unifi_scrape_runs WHERE id = %s",
+        (run_id,),
+    ).fetchone()
+    assert row == ("done", 412, 3, True)

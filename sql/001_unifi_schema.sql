@@ -69,3 +69,23 @@ CREATE INDEX IF NOT EXISTS unifi_orders_order_status_idx
     ON unifi_orders (order_status);
 CREATE INDEX IF NOT EXISTS unifi_orders_status_idx
     ON unifi_orders (status);
+
+CREATE TABLE IF NOT EXISTS unifi_scrape_runs (
+    id               bigserial PRIMARY KEY,
+    job_id           text,
+    month_text       text,
+    year             integer,
+    scrape_mode      text,
+    triggered_by     text,          -- "cron" | "admin"
+    started_at       timestamptz NOT NULL DEFAULT now(),
+    finished_at      timestamptz,
+    status           text,          -- running | done | error
+    orders_processed integer,
+    successful       integer,
+    skipped          integer,
+    failed           integer,
+    error            text
+);
+
+CREATE INDEX IF NOT EXISTS unifi_scrape_runs_started_idx
+    ON unifi_scrape_runs (started_at DESC);
