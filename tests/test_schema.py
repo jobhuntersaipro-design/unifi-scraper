@@ -44,3 +44,44 @@ def test_display_name_is_not_writable(db):
     )
     with pytest.raises(psycopg_errors_GeneratedAlways):
         db.execute("UPDATE unifi_channels SET display_name = 'nope' WHERE channel_code = 'RV1'")
+
+
+def test_orders_table_exists_with_expected_columns(db):
+    cols = {
+        r[0]: r[1]
+        for r in db.execute(
+            "SELECT column_name, data_type FROM information_schema.columns"
+            " WHERE table_name = 'unifi_orders'"
+        ).fetchall()
+    }
+    assert cols["order_number"] == "text"
+    assert cols["created_date"] == "timestamp with time zone"
+    assert cols["status_scrape_date"] == "timestamp with time zone"
+    assert cols["raw"] == "jsonb"
+    assert cols["last_synced"] == "timestamp with time zone"
+
+
+def test_orders_indexes_exist(db):
+    names = {
+        r[0]
+        for r in db.execute(
+            "SELECT indexname FROM pg_indexes WHERE tablename = 'unifi_orders'"
+        ).fetchall()
+    }
+    assert "unifi_orders_updated_date_idx" in names
+    assert "unifi_orders_org_code_idx" in names
+    assert "unifi_orders_order_status_idx" in names
+    assert "unifi_orders_status_idx" in names
+
+
+def test_org_code_is_not_a_foreign_key(db):
+    # A rover appears in the Unifi portal before anyone adds it to the
+    # fleet list. With an FK that order fails to insert and the data is
+    # lost; without one it lands and shows up in the Unmapped panel.
+    db.execute(
+        "INSERT INTO unifi_orders (order_number, org_code) VALUES ('ORD1', 'RV99999')"
+    )
+    got = db.execute(
+        "SELECT org_code FROM unifi_orders WHERE order_number = 'ORD1'"
+    ).fetchone()[0]
+    assert got == "RV99999"

@@ -28,3 +28,44 @@ CREATE TABLE IF NOT EXISTS unifi_channels (
     created_at       timestamptz NOT NULL DEFAULT now(),
     updated_at       timestamptz NOT NULL DEFAULT now()
 );
+
+-- Scraped from the Unifi dealer portal. `org_code` is deliberately NOT a
+-- foreign key to unifi_channels: a new rover appears in the portal
+-- before anyone adds it to the fleet list, and an FK would drop that
+-- order on the floor instead of surfacing it as work to do.
+CREATE TABLE IF NOT EXISTS unifi_orders (
+    order_number       text PRIMARY KEY,
+    event_type         text,
+    order_status       text,
+    created_date       timestamptz,
+    updated_date       timestamptz,
+    org_code           text,
+    organization_name  text,
+    customer_name      text,
+    company_name       text,
+    email              text,
+    phone_number       text,
+    appointment_date   timestamptz,
+    address            text,
+    package            text,
+    device             text,
+    ic_number          text,
+    creator            text,
+    cust_id            text,
+    -- installation status, from the subscriber API
+    status             text,
+    status_latest_date timestamptz,
+    -- when we last VERIFIED the status, as opposed to when it changed
+    status_scrape_date timestamptz,
+    last_synced        timestamptz NOT NULL DEFAULT now(),
+    raw                jsonb
+);
+
+CREATE INDEX IF NOT EXISTS unifi_orders_updated_date_idx
+    ON unifi_orders (updated_date DESC);
+CREATE INDEX IF NOT EXISTS unifi_orders_org_code_idx
+    ON unifi_orders (org_code);
+CREATE INDEX IF NOT EXISTS unifi_orders_order_status_idx
+    ON unifi_orders (order_status);
+CREATE INDEX IF NOT EXISTS unifi_orders_status_idx
+    ON unifi_orders (status);
