@@ -42,9 +42,24 @@ file rather than six components.
 
 ## 3. Open questions (blocking the parts they touch)
 
-1. **Order volume** — roughly how many rows per month, and how many months are
-   kept? The pagination and index plan in §5 assumes 10k–100k total. Under ~5k
-   the simpler load-everything pattern of `OrderOversight` would do.
+**Answered 2026-09-20** (see `docs/superpowers/specs/2026-09-20-unifi-neon-writer-design.md`):
+
+1. ~~**Order volume**~~ — **over 2,000 orders/month.** The §5 pagination and
+   index plan stands as written; the load-everything pattern of `OrderOversight`
+   is ruled out.
+4. ~~**Same Neon branch**~~ — **yes, same project and branch**, but the scraper
+   connects as its own `unifi_scraper` role granted only on the `unifi_*` tables,
+   not with the portal's connection string. The scraper runs on a droplet and its
+   credentials sit on disk; a compromise there should not reach the portal's own
+   data.
+
+Also decided: **the DDL is canonical in the scraper repo** (`sql/001_unifi_schema.sql`),
+and the portal's hand-written Prisma migration is a checksum-verified copy of it,
+registered with `prisma migrate resolve`. This reverses §4.1's implied ownership
+so that the scraper can start filling Neon before any portal page exists.
+
+Still open:
+
 2. **Where does the Flask scraper run, and is it reachable from Vercel?** The
    order-entry scraper is a droplet at `scraper.bizzflow.top`. Is `api_server.py`
    on the same box (different port) or somewhere else? "Sync now" needs a public
@@ -53,9 +68,6 @@ file rather than six components.
    maintained — it reads that sheet directly. Do we (a) repoint n8n at Neon in
    the same change, (b) keep writing the sheet as a read-only mirror during a
    transition, or (c) retire the workflow and send Telegram from the portal?
-4. **Same Neon branch** as the portal's production DB, confirmed? These tables
-   join to nothing in the existing schema, but they share migrations and the
-   connection.
 5. **Timeline retention** — keep status events forever, or prune after N months?
    Forever is my default (they're small and they're the audit trail).
 
@@ -333,12 +345,24 @@ Clicking it opens a small popover: month + year (defaults to current) and mode
 (incremental / full). `adminTriggerUnifiSync` then:
 1. `requireAdmin()`
 2. rate-limits via the existing `src/lib/rate-limit.ts` (Upstash) — **1 sync per 5 minutes**, since a scrape drives a real browser session against the dealer portal
-3. `POST ${UNIFI_SCRAPER_API_URL}/scrape` with `X-Internal-Token`, `AbortSignal.timeout(10_000)` and `cache: "no-store"` — mirroring `src/lib/order-start.ts`
+3. `POST ${UNIFI_SCRAPER_API_URL}/jobs` with `X-Internal-Token`, `AbortSignal.timeout(10_000)` and `cache: "no-store"` — mirroring `src/lib/order-start.ts`
 4. inserts a `unifi_scrape_runs` row with `triggeredBy: "admin"`, `status: "running"`
 5. returns the job id; the button becomes a live "Syncing…" state
 
-The scraper already holds a per-month lock (`scrape_locks` in `api_server.py`).
-A busy response is a toast ("A sync for Sep 2026 is already running"), not an error.
+> **Corrected 2026-09-20 against the actual `api_server.py`.** An earlier draft of
+> this section named `POST /scrape` and a poll of `/status/<job_id>`. Neither is
+> right. `/scrape` is *blocking* — it returns only when the scrape finishes, so a
+> 10-second abort would always fire. The async job API is `POST /jobs` →
+> `GET /jobs/<job_id>`, and `/status` is an unrelated summary endpoint that takes
+> no job id.
+
+Two further facts about the lock, both differing from what this section assumed:
+`scrape_locks` is defined twice in `api_server.py` (lines 24 and 297), the second
+definition silently discarding anything held by the first; and `POST /jobs`
+enforces a **global** single-job lock, not a per-month one, so it rejects a new
+job while *any* month is running. Until that is fixed, a busy response cannot
+honestly say "A sync for Sep 2026 is already running" — it means "a sync is
+already running". A busy response is a toast, not an error.
 
 ### 8.2 Completion
 `POST /api/hooks/unifi-scraper`, modelled exactly on the existing
@@ -358,7 +382,10 @@ Required before the button ships:
    refuse with 503 when the env var is unset (same posture as the webhook route).
 2. `/save_credentials` additionally restricted or removed — it writes the
    encrypted credential store.
-3. CORS limited to the portal origin.
+3. ~~CORS limited to the portal origin.~~ **Dropped** — there is no CORS
+   handling in the scraper and `flask-cors` is not a dependency. A Vercel server
+   action is server-to-server and sends no browser `Origin`, so this would
+   protect nothing. The exposure is the missing authentication, covered by item 1.
 
 ### 8.4 New environment variables
 ```
@@ -409,8 +436,13 @@ the n8n repoint (question 3).
 
 ## 12. Build order
 
-1. **Migration + models** (§4) — nothing user-visible; verifiable by criteria 1–3.
-2. **`neon_writer.py` in the scraper** — dual-write to Sheets and Neon, run a week, compare.
+1. **Schema + writer in the scraper repo** — `sql/001_unifi_schema.sql` (canonical
+   DDL) and `neon_writer.py` dual-writing to Sheets and Neon, plus a one-time
+   backfill of every month tab. Verifiable by criteria 1–3. Designed in
+   `docs/superpowers/specs/2026-09-20-unifi-neon-writer-design.md` in that repo.
+2. **Prisma models + migration in the portal** — a checksum-verified copy of the
+   SQL above, registered with `prisma migrate resolve`. Run the dual-write a week
+   and compare before anything reads from Neon.
 3. **Page 1 read-only** (§5) — the moment the sheet stops being the UI.
 4. **Page 2 + import** (§6) — flip the source of truth; answer question 3 before this lands.
 5. **Page 3** (§7).
