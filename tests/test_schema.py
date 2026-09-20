@@ -107,3 +107,24 @@ def test_scrape_runs_round_trips(db):
         (run_id,),
     ).fetchone()
     assert row == ("done", 412, 3, True)
+
+
+def test_scraper_role_has_minimal_grants(db):
+    def privs(table):
+        return {
+            r[0]
+            for r in db.execute(
+                "SELECT privilege_type FROM information_schema.table_privileges"
+                " WHERE grantee = 'unifi_scraper' AND table_name = %s",
+                (table,),
+            ).fetchall()
+        }
+
+    assert privs("unifi_orders") == {"SELECT", "INSERT", "UPDATE"}
+    # INSERT here is NOT optional: a trigger function runs with the
+    # privileges of the role that fired it, not the table owner, so
+    # without this every scraper write fails.
+    assert privs("unifi_order_status_events") == {"SELECT", "INSERT"}
+    assert privs("unifi_scrape_runs") == {"SELECT", "INSERT", "UPDATE"}
+    # The portal owns the channel list; the scraper only reads it.
+    assert privs("unifi_channels") == {"SELECT"}

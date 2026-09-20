@@ -1,3 +1,4 @@
+-- schema-checksum: be736dde6df4098ed9e023235fe97ef5ae09ead9d07576b7d44fa442928951c9
 -- Canonical DDL for the Unifi scraper's Neon tables.
 --
 -- THIS FILE IS THE SOURCE OF TRUTH. The portal repo
@@ -238,3 +239,33 @@ WHERE o.org_code IS NOT NULL
   AND o.org_code <> ''
   AND c.channel_code IS NULL
 GROUP BY o.org_code;
+
+-- The scraper connects as its own role, not as the portal's. It runs on
+-- a droplet with credentials on disk; a compromise there should not
+-- reach the portal's own tables.
+--
+-- Roles are cluster-wide, not per-database, so this is guarded for the
+-- test suite, which builds many databases in one cluster.
+DO $role$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'unifi_scraper') THEN
+        CREATE ROLE unifi_scraper LOGIN;
+    END IF;
+END
+$role$;
+
+GRANT USAGE ON SCHEMA public TO unifi_scraper;
+
+GRANT SELECT, INSERT, UPDATE ON unifi_orders     TO unifi_scraper;
+GRANT SELECT, INSERT, UPDATE ON unifi_scrape_runs TO unifi_scraper;
+GRANT SELECT                  ON unifi_channels   TO unifi_scraper;
+
+-- A trigger function runs with the privileges of the role that caused
+-- it to fire, NOT the table owner. Without INSERT here, every write the
+-- scraper makes to unifi_orders fails. The alternative is SECURITY
+-- DEFINER, which is more privilege than a row-level audit trigger
+-- should carry.
+GRANT SELECT, INSERT ON unifi_order_status_events TO unifi_scraper;
+
+GRANT USAGE ON SEQUENCE unifi_order_status_events_id_seq TO unifi_scraper;
+GRANT USAGE ON SEQUENCE unifi_scrape_runs_id_seq         TO unifi_scraper;
