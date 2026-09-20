@@ -118,3 +118,42 @@ def test_timeline_carries_the_channel_display_name(seeded):
         " WHERE order_number = 'O1' ORDER BY changed_at DESC LIMIT 1"
     ).fetchone()
     assert row[0] == "CAR 1"
+
+
+def test_channel_display_name_falls_through_empty_organization_name(db):
+    # organization_name == '' with no unifi_channels row for the org code:
+    # coalesce() alone would let the empty string win over org_code, since
+    # coalesce only skips NULL, not ''. The label must fall through to
+    # org_code instead of rendering blank.
+    db.execute(
+        "INSERT INTO unifi_orders"
+        " (order_number, org_code, organization_name, order_status, created_date)"
+        " VALUES ('O1', 'RV77777', '', 'In Progress', '2026-09-15 10:00+08')"
+    )
+    row = db.execute(
+        "SELECT channel_display_name FROM unifi_order_status_timeline"
+        " WHERE order_number = 'O1'"
+    ).fetchone()
+    assert row[0] == "RV77777"
+
+
+def test_channel_breakdown_collapses_unmapped_codes_despite_label_drift(db):
+    # Two orders share one unmapped org_code in the same month, but the
+    # scraped organization_name differs by case/whitespace between them.
+    # Grouping by the resolved label (as well as org_code) would split
+    # this one rover's counts across two rows; it must stay one row.
+    db.execute(
+        "INSERT INTO unifi_orders"
+        " (order_number, org_code, organization_name, order_status, created_date)"
+        " VALUES ('O1', 'RV99999', 'Rover 99999', 'In Progress', '2026-09-15 10:00+08')"
+    )
+    db.execute(
+        "INSERT INTO unifi_orders"
+        " (order_number, org_code, organization_name, order_status, created_date)"
+        " VALUES ('O2', 'RV99999', 'ROVER 99999 ', 'In Progress', '2026-09-16 10:00+08')"
+    )
+    rows = db.execute(
+        "SELECT org_code, total FROM unifi_monthly_channel_breakdown"
+        " WHERE org_code = 'RV99999'"
+    ).fetchall()
+    assert rows == [("RV99999", 2)]

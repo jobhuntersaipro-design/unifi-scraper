@@ -170,7 +170,7 @@ SELECT
     e.cust_id,
     e.scrape_run_id,
     o.org_code,
-    coalesce(c.display_name, o.organization_name, o.org_code) AS channel_display_name,
+    coalesce(c.display_name, nullif(o.organization_name, ''), nullif(o.org_code, '')) AS channel_display_name,
     e.changed_at - lag(e.changed_at) OVER w  AS previous_held_for,
     lead(e.changed_at) OVER w - e.changed_at AS held_for
 FROM unifi_order_status_events e
@@ -201,11 +201,16 @@ FROM unifi_orders
 WHERE created_date IS NOT NULL
 GROUP BY 1;
 
+-- Grouped by month + org_code ONLY (not by channel_display_name): for an
+-- unmapped code the label falls back to organization_name, which is
+-- scraped text and can vary in case/whitespace within a month. Grouping
+-- on the label too would split one rover's counts across several rows.
+-- max(...) collapses whichever variant the label expression turns up.
 CREATE OR REPLACE VIEW unifi_monthly_channel_breakdown AS
 SELECT
     date_trunc('month', o.created_date) AS month,
     o.org_code,
-    coalesce(c.display_name, o.organization_name, o.org_code) AS channel_display_name,
+    max(coalesce(c.display_name, nullif(o.organization_name, ''), nullif(o.org_code, ''))) AS channel_display_name,
     count(*) AS total,
     count(*) FILTER (
         WHERE lower(coalesce(o.order_status, '')) = 'completed'
@@ -216,7 +221,7 @@ SELECT
 FROM unifi_orders o
 LEFT JOIN unifi_channels c ON c.channel_code = o.org_code
 WHERE o.created_date IS NOT NULL
-GROUP BY 1, 2, 3;
+GROUP BY 1, 2;
 
 -- Org codes that appear on orders but have no channel row. This is the
 -- queue that is invisible today: those orders print in Telegram as
