@@ -27,3 +27,6 @@ test.py
 response.json
 *.jpg
 workflow.json
+
+# Git worktrees created for isolated task execution
+.claude/worktrees/
