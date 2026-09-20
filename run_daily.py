@@ -22,6 +22,7 @@ from check_custid import check_custids_multi_month
 from check_status import check_status_multi_month, get_last_n_months
 from credential_manager import CredentialManager
 from login_manager import login_and_get_context
+import neon_writer
 
 CUSTID_STATE_FILE = os.path.join(os.path.dirname(__file__), "logs", "custid_state.json")
 
@@ -89,6 +90,17 @@ async def main():
     print(f"=== DAILY RUN: {datetime.now(LOCAL_TZ).strftime('%Y-%m-%d %H:%M')} ===")
     print(f"Months: {months}\n")
 
+    # One run row for the whole nightly job. The month scrapes below are
+    # subprocesses, so they cannot own this -- the parent does, and the
+    # children write orders under it.
+    run_id = neon_writer.start_run(
+        month_text=months[0][0] if months else None,
+        year=months[0][1] if months else None,
+        scrape_mode="incremental",
+        triggered_by="cron",
+    )
+    failed_months = 0
+
     # Step 1: Login to cache session
     await establish_session(username, password)
 
@@ -99,6 +111,8 @@ async def main():
         print(f"  Starting {m} {y}...")
         result = run_scrape_subprocess(m, y)
         results.append(((m, y), result))
+        if result.returncode != 0:
+            failed_months += 1
         status = "OK" if result.returncode == 0 else f"FAILED (exit {result.returncode})"
         print(f"  {m} {y}: {status}")
 
@@ -165,6 +179,20 @@ async def main():
                 await establish_session(username, password)
             else:
                 print(f"  All attempts failed.")
+
+    neon_writer.finish_run(
+        run_id,
+        "error" if failed_months else "done",
+        counts={
+            "orders_processed": len(months),
+            "successful": len(months) - failed_months,
+            "failed": failed_months,
+        },
+    )
+    neon_failures = neon_writer.write_failure_count()
+    if neon_failures:
+        print(f"\n⚠️  {neon_failures} Neon write(s) failed during this run")
+    neon_writer.close()
 
     print(f"\n=== DAILY RUN COMPLETE: {datetime.now(LOCAL_TZ).strftime('%Y-%m-%d %H:%M')} ===")
 
