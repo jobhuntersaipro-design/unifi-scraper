@@ -13,6 +13,7 @@ import functools
 import os
 import threading
 from datetime import datetime
+from typing import NamedTuple
 from zoneinfo import ZoneInfo
 
 from psycopg.types.json import Jsonb
@@ -260,4 +261,101 @@ def upsert_orders(rows) -> int:
         _apply_run_id(conn)
         with conn.cursor() as cur:
             cur.executemany(_UPSERT_SQL, params)
+    return len(params)
+
+
+class StatusUpdate(NamedTuple):
+    """One row's worth of what check_status learned.
+
+    Named rather than a bare 4-tuple because three of the four are
+    strings and a positional slip would be silent.
+    """
+    order_number: str
+    status: str
+    status_latest_date: str = ""
+    new_cust_id: str = ""
+
+
+_STATUS_SQL = """
+UPDATE unifi_orders SET
+    status             = %(status)s,
+    status_latest_date = coalesce(%(status_latest_date)s, status_latest_date),
+    status_scrape_date = %(scraped_at)s,
+    cust_id            = coalesce(%(new_cust_id)s, cust_id),
+    last_synced        = %(scraped_at)s
+WHERE order_number = %(order_number)s
+"""
+
+
+@_guard
+def update_order_statuses(updates) -> int:
+    """Mirror a StatusBatchWriter flush into Neon."""
+    if not updates:
+        return 0
+    pool = _get_pool()
+    if pool is None:
+        return 0
+
+    now = datetime.now(LOCAL_TZ)
+    params = []
+    for item in updates:
+        order_number = text(item.order_number)
+        if not order_number:
+            continue
+        params.append(
+            {
+                "order_number": order_number,
+                # "-" becomes NULL: it was never an observed state.
+                "status": status_text(item.status),
+                "status_latest_date": parse_dt(item.status_latest_date),
+                "new_cust_id": text(item.new_cust_id),
+                "scraped_at": now,
+            }
+        )
+
+    if not params:
+        return 0
+
+    with pool.connection() as conn:
+        _apply_run_id(conn)
+        with conn.cursor() as cur:
+            cur.executemany(_STATUS_SQL, params)
+    return len(params)
+
+
+_CUST_ID_SQL = """
+UPDATE unifi_orders
+   SET cust_id = %(new_cust_id)s,
+       last_synced = %(scraped_at)s
+ WHERE order_number = %(order_number)s
+   AND %(new_cust_id)s::text IS NOT NULL
+"""
+
+
+@_guard
+def update_cust_ids(updates) -> int:
+    """Mirror check_custid's rewrites. `updates` is [(order_number, new_cust_id)]."""
+    if not updates:
+        return 0
+    pool = _get_pool()
+    if pool is None:
+        return 0
+
+    now = datetime.now(LOCAL_TZ)
+    params = [
+        {
+            "order_number": text(order_number),
+            "new_cust_id": text(new_cust_id),
+            "scraped_at": now,
+        }
+        for order_number, new_cust_id in updates
+        if text(order_number)
+    ]
+    if not params:
+        return 0
+
+    with pool.connection() as conn:
+        _apply_run_id(conn)
+        with conn.cursor() as cur:
+            cur.executemany(_CUST_ID_SQL, params)
     return len(params)

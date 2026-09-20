@@ -102,3 +102,82 @@ def test_an_unset_database_url_is_not_counted_as_a_failure(monkeypatch):
         assert neon_writer.write_failure_count() == 0
     finally:
         neon_writer.close()
+
+
+def test_status_update_sets_status_and_scrape_date(writer, db):
+    writer.upsert_orders([_row("O1")])
+    n = writer.update_order_statuses(
+        [writer.StatusUpdate("O1", "Active", "22 Oct 2025", "")]
+    )
+    assert n == 1
+    row = db.execute(
+        "SELECT status, status_latest_date IS NOT NULL, status_scrape_date IS NOT NULL"
+        "  FROM unifi_orders WHERE order_number = 'O1'"
+    ).fetchone()
+    assert row == ("Active", True, True)
+
+
+def test_status_update_writes_a_timeline_event(writer, db):
+    writer.upsert_orders([_row("O1")])
+    writer.update_order_statuses([writer.StatusUpdate("O1", "Active", "22 Oct 2025", "")])
+    rows = db.execute(
+        "SELECT prev_status, status FROM unifi_order_status_events"
+        " WHERE order_number = 'O1' ORDER BY id"
+    ).fetchall()
+    assert rows[-1] == (None, "Active")
+
+
+def test_repeating_a_status_check_writes_no_new_event(writer, db):
+    # The nightly case. status_scrape_date moves every time; the event
+    # log must not.
+    writer.upsert_orders([_row("O1")])
+    writer.update_order_statuses([writer.StatusUpdate("O1", "Active", "22 Oct 2025", "")])
+    before = db.execute("SELECT count(*) FROM unifi_order_status_events").fetchone()[0]
+    writer.update_order_statuses([writer.StatusUpdate("O1", "Active", "22 Oct 2025", "")])
+    writer.update_order_statuses([writer.StatusUpdate("O1", "Active", "22 Oct 2025", "")])
+    after = db.execute("SELECT count(*) FROM unifi_order_status_events").fetchone()[0]
+    assert after == before
+
+
+def test_the_cancelled_sentinel_lands_as_null(writer, db):
+    writer.upsert_orders([_row("O1")])
+    writer.update_order_statuses([writer.StatusUpdate("O1", "-", "", "")])
+    got = db.execute("SELECT status FROM unifi_orders WHERE order_number = 'O1'").fetchone()
+    assert got[0] is None
+
+
+def test_status_update_can_carry_a_new_cust_id(writer, db):
+    writer.upsert_orders([_row("O1")])
+    writer.update_order_statuses([writer.StatusUpdate("O1", "Active", "22 Oct 2025", "20999")])
+    got = db.execute("SELECT cust_id FROM unifi_orders WHERE order_number = 'O1'").fetchone()
+    assert got[0] == "20999"
+
+
+def test_blank_cust_id_does_not_wipe_the_existing_one(writer, db):
+    writer.upsert_orders([_row("O1")])
+    writer.update_order_statuses([writer.StatusUpdate("O1", "Active", "22 Oct 2025", "")])
+    got = db.execute("SELECT cust_id FROM unifi_orders WHERE order_number = 'O1'").fetchone()
+    assert got[0] == "10555"
+
+
+def test_update_cust_ids_rewrites_and_logs_an_event(writer, db):
+    writer.upsert_orders([_row("O1")])
+    before = db.execute("SELECT count(*) FROM unifi_order_status_events").fetchone()[0]
+    assert writer.update_cust_ids([("O1", "20999")]) == 1
+    got = db.execute("SELECT cust_id FROM unifi_orders WHERE order_number = 'O1'").fetchone()
+    assert got[0] == "20999"
+    after = db.execute("SELECT count(*) FROM unifi_order_status_events").fetchone()[0]
+    assert after == before + 1
+
+
+def test_update_cust_ids_ignores_unknown_orders(writer, db):
+    # check_custid works from sheet rows; an order missing from Neon is
+    # not an error, it just has not been backfilled yet.
+    assert writer.update_cust_ids([("NOPE", "20999")]) == 1
+    assert db.execute("SELECT count(*) FROM unifi_orders").fetchone()[0] == 0
+
+
+def test_status_updates_of_an_empty_list_is_a_no_op(writer):
+    assert writer.update_order_statuses([]) == 0
+    assert writer.update_cust_ids([]) == 0
+    assert writer.write_failure_count() == 0
