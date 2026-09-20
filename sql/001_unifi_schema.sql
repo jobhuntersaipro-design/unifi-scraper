@@ -89,3 +89,66 @@ CREATE TABLE IF NOT EXISTS unifi_scrape_runs (
 
 CREATE INDEX IF NOT EXISTS unifi_scrape_runs_started_idx
     ON unifi_scrape_runs (started_at DESC);
+
+-- Append-only. One row per OBSERVED CHANGE, never one per check.
+CREATE TABLE IF NOT EXISTS unifi_order_status_events (
+    id                 bigserial PRIMARY KEY,
+    order_number       text NOT NULL,
+    order_status       text,
+    status             text,
+    status_latest_date timestamptz,
+    cust_id            text,
+    prev_order_status  text,
+    prev_status        text,
+    changed_at         timestamptz NOT NULL DEFAULT now(),
+    scrape_run_id      bigint
+);
+
+CREATE INDEX IF NOT EXISTS unifi_order_status_events_order_changed_idx
+    ON unifi_order_status_events (order_number, changed_at DESC);
+CREATE INDEX IF NOT EXISTS unifi_order_status_events_changed_idx
+    ON unifi_order_status_events (changed_at DESC);
+
+-- NAME MATTERS. The portal owns an `order_status_events` table in this
+-- same schema and very likely a `log_order_status_change()` behind it.
+-- Trigger functions are schema-scoped, and CREATE OR REPLACE FUNCTION
+-- does not error on a name clash -- it replaces. Hence the prefix.
+CREATE OR REPLACE FUNCTION unifi_log_order_status_change()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $fn$
+BEGIN
+    -- Exactly three columns are compared. status_scrape_date and
+    -- last_synced move on every single check and must stay out, or a
+    -- quiet night writes one event per order.
+    IF TG_OP = 'UPDATE' AND NOT (
+           NEW.order_status IS DISTINCT FROM OLD.order_status
+        OR NEW.status       IS DISTINCT FROM OLD.status
+        OR NEW.cust_id      IS DISTINCT FROM OLD.cust_id
+    ) THEN
+        RETURN NULL;
+    END IF;
+
+    INSERT INTO unifi_order_status_events (
+        order_number, order_status, status, status_latest_date, cust_id,
+        prev_order_status, prev_status, scrape_run_id
+    ) VALUES (
+        NEW.order_number,
+        NEW.order_status,
+        NEW.status,
+        NEW.status_latest_date,
+        NEW.cust_id,
+        CASE WHEN TG_OP = 'UPDATE' THEN OLD.order_status END,
+        CASE WHEN TG_OP = 'UPDATE' THEN OLD.status END,
+        nullif(current_setting('unifi.scrape_run_id', true), '')::bigint
+    );
+
+    RETURN NULL;
+END;
+$fn$;
+
+DROP TRIGGER IF EXISTS unifi_orders_status_change ON unifi_orders;
+CREATE TRIGGER unifi_orders_status_change
+    AFTER INSERT OR UPDATE ON unifi_orders
+    FOR EACH ROW
+    EXECUTE FUNCTION unifi_log_order_status_change();
