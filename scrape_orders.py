@@ -43,6 +43,47 @@ def _offer_name(item: dict) -> str:
     return item.get("mainOfferName") or item.get("offerName") or ""
 
 
+def _is_uni5g(name: str) -> bool:
+    return (name or "").strip().lower().startswith("uni5g")
+
+
+def select_service_numbers(order_items: list, package: str = "") -> str:
+    """Mobile service numbers for a UNI5G order, as `<number>(<iccid>)`.
+
+    The portal splits an MSISDN across two fields -- `prefix` holds the country
+    code ("60") and `accNbr` the rest -- so the full number exists nowhere in
+    the response and has to be joined. `iccid` (the SIM serial) sits directly on
+    the order item, not down in offerInstList.attrValueList where the fibre
+    orders keep their device serial.
+
+    One order carries one line per item, so this returns a comma-separated list
+    in source order. Do not sort it: item 2 of order 2609000125646283 pairs
+    ...6983 with ...404 while item 3 pairs ...7291 with ...388, so sorting would
+    silently mismatch numbers to SIMs.
+
+    Empty for anything that is not UNI5G -- fibre items carry non-numeric
+    accNbrs like "HSTB11382107" and "avionic5043@unifi", which are not service
+    numbers.
+    """
+    if not _is_uni5g(package):
+        return ""
+
+    numbers = []
+    for item in order_items:
+        # A mobile line, identified either by its own UNI5G offer or by having
+        # a SIM. Keeps a fibre item out of a mixed bundle.
+        if not (_is_uni5g(_offer_name(item)) or item.get("iccid")):
+            continue
+        acc = str(item.get("accNbr") or "").strip()
+        if not acc:
+            continue
+        number = f"{str(item.get('prefix') or '').strip()}{acc}"
+        iccid = str(item.get("iccid") or "").strip()
+        numbers.append(f"{number}({iccid})" if iccid else number)
+
+    return ",".join(numbers)
+
+
 def select_package(order_items: list) -> str:
     """Pick the customer-facing package name out of an order's orderItemList.
 
@@ -1004,6 +1045,9 @@ async def scrape_orders_month(
                             # --- MOVED UP: Package Logic (Needed for Company Name check) ---
                             order_items = data.get("orderItemList", []) or []
                             package = select_package(order_items)
+                            service_numbers = select_service_numbers(
+                                order_items, package
+                            )
 
                             # --- Company Name Logic ---
                             company_name = ""
@@ -1153,6 +1197,7 @@ async def scrape_orders_month(
                                 "Appointment Date": appointment_date,
                                 "Address": address,
                                 "Package": package,
+                                "Service Number": service_numbers,
                                 "Device": device_name,
                                 "IC Number": ic_number,
                                 "Creator": creator,

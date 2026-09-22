@@ -22,6 +22,7 @@ HEADERS = [
     "Appointment Date",
     "Address",
     "Package",
+    "Service Number",
     "Device",
     "IC Number",
     "Creator",
