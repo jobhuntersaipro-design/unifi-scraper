@@ -9,3 +9,5 @@ google-auth
 google-auth-oauthlib
 google-auth-httplib2
 google-api-python-client
+psycopg[binary,pool]==3.2.*
+pytest==8.*

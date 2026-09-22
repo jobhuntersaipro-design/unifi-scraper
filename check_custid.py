@@ -23,6 +23,7 @@ from check_status import (
     _all_inactive,
 )
 from gsheets_writer import HEADERS, month_tab_title, open_sheet
+import neon_writer
 
 
 def get_old_custid_orders(ws) -> Tuple[List[Dict], list]:
@@ -88,6 +89,34 @@ def get_old_custid_orders(ws) -> Tuple[List[Dict], list]:
     return orders, headers
 
 
+def write_custid_updates(ws, custid_col: int, updates) -> int:
+    """Write new cust ids to the sheet, then mirror them into Neon.
+
+    `updates` is [(row_index, order_number, old_custid, new_custid)].
+
+    Sheets is authoritative: if its write raises, the exception
+    propagates and nothing is mirrored. cust_id is one of the three
+    columns the status trigger watches, so a missed update here is a
+    missing timeline event, not just a stale cell -- which is why this
+    nightly path mirrors and the one-off backfill_*.py scripts do not.
+    """
+    if not updates:
+        return 0
+
+    from gspread.utils import rowcol_to_a1
+
+    batch = [
+        {"range": rowcol_to_a1(row_idx, custid_col), "values": [[new]]}
+        for row_idx, _order_number, _old, new in updates
+    ]
+    ws.batch_update(batch, value_input_option="USER_ENTERED")
+
+    neon_writer.update_cust_ids(
+        [(order_number, new) for _row_idx, order_number, _old, new in updates if order_number]
+    )
+    return len(updates)
+
+
 async def check_custids_for_month(
     page,
     iframe_frame,
@@ -141,7 +170,7 @@ async def check_custids_for_month(
     updated = 0
     same = 0
     errors = 0
-    updates = []  # (row_index, old_custid, new_custid)
+    updates = []  # (row_index, order_number, old_custid, new_custid)
 
     query_num = 0
     for key, group in ic_groups.items():
@@ -182,7 +211,9 @@ async def check_custids_for_month(
                     print(f" -> {best_new} ✓")
                     updated += 1
                     for order in group:
-                        updates.append((order["row_index"], old_cust_id, best_new))
+                        updates.append(
+                            (order["row_index"], order["order_number"], old_cust_id, best_new)
+                        )
                 else:
                     print(f" -> new IDs found but no subscriber data")
                     same += 1
@@ -200,18 +231,9 @@ async def check_custids_for_month(
 
     # Write updates
     if write and updates:
-        from gspread.utils import rowcol_to_a1
         custid_col = headers.index("Cust ID") + 1
-
-        batch = []
-        for row_idx, old, new in updates:
-            batch.append({
-                "range": rowcol_to_a1(row_idx, custid_col),
-                "values": [[new]],
-            })
-
-        ws.batch_update(batch, value_input_option="USER_ENTERED")
-        print(f"  ✅ Updated {len(updates)} rows in the sheet")
+        write_custid_updates(ws, custid_col, updates)
+        print(f"  ✅ Updated {len(updates)} rows in the sheet and Neon")
     elif updates and not write:
         print(f"  Run with --write to apply these updates")
 
