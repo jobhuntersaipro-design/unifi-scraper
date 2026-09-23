@@ -66,17 +66,31 @@ async def establish_session(username: str, password: str):
     await pw.stop()
 
 
-def run_scrape_subprocess(month: str, year: int) -> subprocess.CompletedProcess:
+# How many of the most recent months also get the Ongoing tab. Ongoing only
+# ever holds in-flight orders, so older months have nothing there worth the
+# second pass -- anything that was provisioning months ago has long since
+# landed in History. get_last_n_months returns newest first, so this is a
+# prefix of that list.
+ONGOING_MONTHS = 2
+
+
+def run_scrape_subprocess(
+    month: str, year: int, tabs: tuple = ("history", "ongoing")
+) -> subprocess.CompletedProcess:
     """Run a single month scrape as a subprocess so each gets its own browser."""
     return subprocess.run(
-        [sys.executable, "-c", f"""
+        # -u so the child streams into daily_run.log instead of block-buffering
+        # its output until it exits.
+        [sys.executable, "-u", "-c", f"""
 import asyncio
 from dotenv import load_dotenv
 load_dotenv()
 from credential_manager import CredentialManager
 from scrape_orders import scrape_incremental_to_sheets
 creds = CredentialManager().get_credentials()
-asyncio.run(scrape_incremental_to_sheets(creds["username"], creds["password"], "{month}", {year}))
+asyncio.run(scrape_incremental_to_sheets(
+    creds["username"], creds["password"], "{month}", {year}, tabs={tabs!r}
+))
 """],
         capture_output=False,
     )
@@ -113,9 +127,12 @@ async def main():
         # Step 2: Scrape all 6 months sequentially (1GB server can't handle parallel browsers)
         print(f"=== STEP 2: Scraping {len(months)} months sequentially ===")
         results = []
-        for m, y in months:
-            print(f"  Starting {m} {y}...")
-            result = run_scrape_subprocess(m, y)
+        for i, (m, y) in enumerate(months):
+            # Ongoing only for the most recent ONGOING_MONTHS; older months
+            # get History alone.
+            tabs = ("history", "ongoing") if i < ONGOING_MONTHS else ("history",)
+            print(f"  Starting {m} {y} [{'+'.join(tabs)}]...")
+            result = run_scrape_subprocess(m, y, tabs)
             results.append(((m, y), result))
             if result.returncode != 0:
                 failed_months += 1
