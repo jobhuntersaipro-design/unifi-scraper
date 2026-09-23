@@ -6,6 +6,7 @@ Supports both CSV export (Telegram) and Google Sheets (daily)
 import csv
 import json
 import os
+import sys
 from datetime import datetime, time
 from typing import Dict, List, Optional, Tuple
 
@@ -41,6 +42,118 @@ def _is_generic_offer(name: str) -> bool:
 
 def _offer_name(item: dict) -> str:
     return item.get("mainOfferName") or item.get("offerName") or ""
+
+
+# The Retail Order page is one URL (/esales/retailHistory) with two pills that
+# swap the table in place without navigating, so a tab is chosen by clicking its
+# label. Everything after the click -- agents, month picker, pagination, Details
+# -- is identical between them.
+TABS = {"history": "History", "ongoing": "Ongoing"}
+
+# History first: an order that completes between the two passes should end up
+# recorded as completed, not left at the in-flight state an Ongoing row would
+# write over it.
+DEFAULT_TABS = ("history", "ongoing")
+
+# Order states worth scraping per tab; None means take everything.
+#
+# Ongoing lists Provisioning, Waiting for payment and On-held. Only
+# Provisioning is wanted -- the rest are not committed work yet. Nothing is
+# lost by skipping them: when one does progress it lands in History, and
+# gsheets_writer.upsert_rows keys on Order Number, so it updates that order's
+# existing row rather than adding a second one.
+#
+# Matched as a substring because the cell renders with a status dot, so the
+# text can arrive as "• Provisioning".
+TAB_STATE_FILTER = {"ongoing": ("provisioning",), "history": None}
+
+# Cell positions used when the header row cannot be read. These are the
+# long-standing History positions.
+FALLBACK_COLS = {
+    "order": 0,
+    "event": 1,
+    "state": 3,
+    "created": 4,
+    "updated": 5,
+    "org_code": 9,
+    "org_name": 10,
+}
+
+# Header label -> logical key. Several spellings map to one key because the two
+# tabs do not label these columns identically ("Last Updated Date" on Ongoing).
+HEADER_ALIASES = {
+    "order number": "order",
+    "event type": "event",
+    "order state": "state",
+    "order status": "state",
+    "created date": "created",
+    "last updated date": "updated",
+    "updated date": "updated",
+    "org code": "org_code",
+    "organization name": "org_name",
+    "organisation name": "org_name",
+}
+
+
+async def column_index_map(page) -> Dict[str, int]:
+    """Map logical column keys to <td> positions by reading the table header.
+
+    Positions were previously hardcoded, which is safe only while both tabs
+    share a layout. Ongoing carries a "Last Updated Date" column, and whatever
+    sits at positions 9 and 10 is off-screen behind a horizontal scroll on both
+    tabs -- so a shifted column would silently file Org Code under Organization
+    Name rather than fail. Reading the header makes that impossible; the fixed
+    positions remain as a fallback so a missing header row cannot stop a scrape.
+    """
+    cols = dict(FALLBACK_COLS)
+    try:
+        headers = await page.locator(
+            "div.ant-table-content thead.ant-table-thead th"
+        ).all_text_contents()
+        found = {}
+        for i, label in enumerate(headers):
+            key = HEADER_ALIASES.get(label.strip().lower())
+            if key and key not in found:
+                found[key] = i
+        if not found:
+            print("  ⚠️ No recognisable table headers — using fixed column positions")
+            return cols
+        cols.update(found)
+        missing = sorted(set(FALLBACK_COLS) - set(found))
+        if missing:
+            print(f"  ⚠️ Headers missing {missing} — fixed positions used for those")
+        moved = {k: (FALLBACK_COLS[k], v) for k, v in found.items()
+                 if FALLBACK_COLS[k] != v}
+        if moved:
+            print(f"  ℹ️ Column positions differ from default: {moved}")
+    except Exception as e:
+        print(f"  ⚠️ Could not read table headers ({e}) — using fixed positions")
+    return cols
+
+
+
+def tabs_from_argv(argv=None) -> Tuple[str, ...]:
+    """Which tabs a runner script should scrape, from its command line.
+
+        python run_scrape_test_sep.py             -> both
+        python run_scrape_test_sep.py --history   -> History only
+        python run_scrape_test_sep.py --ongoing   -> Ongoing only
+
+    Passing both flags means both, which is already the default.
+    """
+    argv = sys.argv[1:] if argv is None else argv
+    history, ongoing = "--history" in argv, "--ongoing" in argv
+    if history and not ongoing:
+        return ("history",)
+    if ongoing and not history:
+        return ("ongoing",)
+    return DEFAULT_TABS
+
+
+def _cell_text(cells, cols, key):
+    """Text of the column `key`, or '' when the row is short or key unmapped."""
+    i = cols.get(key, -1)
+    return cells[i] if 0 <= i < len(cells) else ""
 
 
 def _is_uni5g(name: str) -> bool:
@@ -465,6 +578,7 @@ async def scrape_orders_month(
     csv_filename: Optional[str] = None,
     full_sync: bool = True,  # NEW: Set to True to capture everything, False for smart sync
     check_status: bool = False,  # Run subscriber status check after scraping
+    tab: str = "history",  # "history" (completed) or "ongoing" (in-flight)
 ) -> Dict:
     """
     Scrape orders by clicking Details and capturing API response
@@ -512,27 +626,29 @@ async def scrape_orders_month(
             print(f"📄 CSV file: {csv_path}")
             ws = None
 
-        # Navigate to History
-        print("\n📑 Navigating to History tab...")
+        # Select the Ongoing/History pill. Same URL either way — the table is
+        # swapped in place, so this click is the only thing that differs.
+        tab_label = TABS[tab]
+        print(f"\n📑 Selecting {tab_label} tab...")
         print(f"  📍 Current URL: {page.url}")
-        await page.screenshot(path="logs/before_history_click.png")
+        await page.screenshot(path=f"logs/before_{tab}_click.png")
 
-        # Retry clicking History tab — the page may still be loading
-        history_clicked = False
+        # Retry — the page may still be loading
+        tab_clicked = False
         for attempt in range(3):
             try:
-                await page.locator('text="History"').last.click(timeout=15000)
-                history_clicked = True
-                print(f"  ✅ History tab clicked (attempt {attempt + 1})")
+                await page.locator(f'text="{tab_label}"').last.click(timeout=15000)
+                tab_clicked = True
+                print(f"  ✅ {tab_label} tab clicked (attempt {attempt + 1})")
                 await page.wait_for_timeout(10000)
                 break
             except Exception as e:
                 print(f"  ⚠️ Attempt {attempt + 1} failed: {e}")
                 await page.wait_for_timeout(5000)
 
-        if not history_clicked:
-            print("  ❌ All History tab attempts failed")
-            await page.screenshot(path="logs/history_tab_failed.png")
+        if not tab_clicked:
+            print(f"  ❌ All {tab_label} tab attempts failed")
+            await page.screenshot(path=f"logs/{tab}_tab_failed.png")
 
         # Set month filter with YEAR support
         try:
@@ -823,6 +939,15 @@ async def scrape_orders_month(
 
                     print(f"  Processing {len(order_rows)} rows...")
 
+                    # Resolve column positions from the header once per page —
+                    # Ongoing and History are not guaranteed to share a layout.
+                    cols = await column_index_map(page)
+
+                    # States this tab cares about (None = all). Ongoing is
+                    # narrowed to Provisioning; see TAB_STATE_FILTER.
+                    wanted_states = TAB_STATE_FILTER.get(tab)
+                    state_skipped = 0
+
                     # Capture first visible row's ID to confirm pagination changes later
                     if order_rows:
                         _first_cell_text = (
@@ -852,16 +977,23 @@ async def scrape_orders_month(
 
                     for row_idx, row in enumerate(order_rows, 1):
                         try:
-                            cells = await row.locator("td").all()
-                            if len(cells) < 1:
+                            cell_els = await row.locator("td").all()
+                            if len(cell_els) < 1:
                                 continue
 
+                            # One pass over the row; positions come from the
+                            # header map rather than being hardcoded.
+                            cells = [
+                                ((await c.text_content()) or "").strip()
+                                for c in cell_els
+                            ]
+
                             # Get order ID
-                            order_id_text = await cells[0].text_content()
+                            order_id_text = _cell_text(cells, cols, "order")
                             if "Batch" in order_id_text:
-                                order_id = order_id_text.strip().split()[0]
+                                order_id = order_id_text.split()[0]
                             else:
-                                order_id = order_id_text.strip()
+                                order_id = order_id_text
 
                             if not (
                                 order_id
@@ -871,40 +1003,26 @@ async def scrape_orders_month(
                                 continue
 
                             # Get UI metadata
-                            event_type = (
-                                (await cells[1].text_content()).strip()
-                                if len(cells) > 1
-                                else ""
-                            )
-                            order_status = (
-                                (await cells[3].text_content()).strip()
-                                if len(cells) > 3
-                                else ""
-                            )
-                            raw_created = (
-                                (await cells[4].text_content()).strip()
-                                if len(cells) > 4
-                                else ""
-                            )
-                            created_date = standardize_date(raw_created)
+                            event_type = _cell_text(cells, cols, "event")
+                            order_status = _cell_text(cells, cols, "state")
 
-                            raw_updated = (
-                                (await cells[5].text_content()).strip()
-                                if len(cells) > 5
-                                else ""
-                            )
-                            updated_date = standardize_date(raw_updated)
+                            # Skip states this tab does not want, before the
+                            # expensive part: each kept row opens its detail
+                            # page and waits on an API response.
+                            if wanted_states and not any(
+                                w in order_status.lower() for w in wanted_states
+                            ):
+                                state_skipped += 1
+                                continue
 
-                            org_code = (
-                                (await cells[9].text_content()).strip()
-                                if len(cells) > 9
-                                else ""
+                            created_date = standardize_date(
+                                _cell_text(cells, cols, "created")
                             )
-                            org_name = (
-                                (await cells[10].text_content()).strip()
-                                if len(cells) > 10
-                                else ""
+                            updated_date = standardize_date(
+                                _cell_text(cells, cols, "updated")
                             )
+                            org_code = _cell_text(cells, cols, "org_code")
+                            org_name = _cell_text(cells, cols, "org_name")
 
                             # Check if order should be skipped (applies to BOTH modes now)
                             should_skip = False
@@ -1292,6 +1410,14 @@ async def scrape_orders_month(
 
                             # Next page
 
+                    if state_skipped:
+                        kept = len(order_rows) - state_skipped
+                        print(
+                            f"  🔎 {TABS[tab]}: kept {kept}/{len(order_rows)} rows "
+                            f"({state_skipped} skipped — state not in "
+                            f"{list(wanted_states)})"
+                        )
+
                     try:
                         # 1) Read current active page number from UI (source of truth)
                         try:
@@ -1656,9 +1782,10 @@ async def scrape_to_sheets(
     year: int,
     full_sync: bool = False,
     check_status: bool = False,
+    tabs: Tuple[str, ...] = DEFAULT_TABS,
 ):
-    return await scrape_orders_month(
-        username, password, month_text, year, "sheets", None, full_sync, check_status
+    return await scrape_tabs_to_sheets(
+        username, password, month_text, year, full_sync, check_status, tabs
     )
 
 
@@ -1683,34 +1810,103 @@ async def scrape_to_csv(
 
 # New convenience functions for specific modes
 async def scrape_full_sync_to_sheets(
-    username: str, password: str, month_text: str, year: int, check_status: bool = False
+    username: str,
+    password: str,
+    month_text: str,
+    year: int,
+    check_status: bool = False,
+    tabs: Tuple[str, ...] = DEFAULT_TABS,
 ):
-    """Scrape ALL orders to sheets (ignores existing data)"""
-    return await scrape_orders_month(
+    """Scrape ALL orders to sheets (ignores existing data), both tabs."""
+    return await scrape_tabs_to_sheets(
         username,
         password,
         month_text,
         year,
-        "sheets",
-        None,
         full_sync=True,
         check_status=check_status,
+        tabs=tabs,
     )
 
 
+async def scrape_tabs_to_sheets(
+    username: str,
+    password: str,
+    month_text: str,
+    year: int,
+    full_sync: bool = False,
+    check_status: bool = False,
+    tabs: Tuple[str, ...] = DEFAULT_TABS,
+) -> Dict:
+    """Scrape each tab in turn into the same monthly sheet.
+
+    Sequential, not parallel: both write the same worksheet, and the second
+    pass reuses the session cache the first one saved -- so only the first can
+    cost an OTP. A browser per tab also keeps peak memory down, which matters
+    on a 1GB host.
+
+    History is done first so that an order which completed between the two
+    passes is written as completed rather than being left at its in-flight
+    state by a later Ongoing row.
+
+    check_status runs only after the final tab: it walks the whole sheet, so
+    running it per tab would repeat the same work.
+    """
+    per_tab, last = {}, len(tabs) - 1
+    for i, name in enumerate(tabs):
+        if name not in TABS:
+            raise ValueError(f"unknown tab {name!r}; expected one of {sorted(TABS)}")
+        print(f"\n{'#' * 70}")
+        print(f"# {TABS[name].upper()} — {month_text} {year}  ({i + 1}/{len(tabs)})")
+        print(f"{'#' * 70}")
+        per_tab[name] = await scrape_orders_month(
+            username,
+            password,
+            month_text,
+            year,
+            "sheets",
+            None,
+            full_sync=full_sync,
+            check_status=check_status and i == last,
+            tab=name,
+        )
+
+    totals = {k: 0 for k in ("total", "successful", "skipped", "failed", "updated")}
+    for r in per_tab.values():
+        for k in totals:
+            totals[k] += r.get(k, 0) or 0
+
+    print(f"\n{'=' * 70}")
+    print(f"ALL TABS COMPLETE — {month_text} {year}")
+    for name, r in per_tab.items():
+        print(f"  {TABS[name]:<8} total={r.get('total', 0)} "
+              f"ok={r.get('successful', 0)} failed={r.get('failed', 0)}")
+    print(f"{'=' * 70}")
+
+    return {
+        "success": all(r.get("success") for r in per_tab.values()),
+        "tabs": per_tab,
+        **totals,
+    }
+
+
 async def scrape_incremental_to_sheets(
-    username: str, password: str, month_text: str, year: int, check_status: bool = False
+    username: str,
+    password: str,
+    month_text: str,
+    year: int,
+    check_status: bool = False,
+    tabs: Tuple[str, ...] = DEFAULT_TABS,
 ):
-    """Smart incremental sync to sheets (only new/updated orders)"""
-    return await scrape_orders_month(
+    """Smart incremental sync to sheets (only new/updated orders), both tabs."""
+    return await scrape_tabs_to_sheets(
         username,
         password,
         month_text,
         year,
-        "sheets",
-        None,
         full_sync=False,
         check_status=check_status,
+        tabs=tabs,
     )
 
 
@@ -1750,3 +1946,4 @@ def scrape_month(month_text: str, year: int, full_sync: bool = True, check_statu
         return result
     finally:
         loop.close()
+
