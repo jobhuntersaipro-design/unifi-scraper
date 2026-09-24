@@ -67,6 +67,23 @@ DEFAULT_TABS = ("history", "ongoing")
 # text can arrive as "• Provisioning".
 TAB_STATE_FILTER = {"ongoing": ("provisioning",), "history": None}
 
+# Order states that will never change again. Anything else -- Provisioning,
+# Waiting for payment, On-held, or blank -- is still in flight and must be
+# re-checked on later runs even though the row already carries a Last Synced.
+#
+# Without this, incremental sync skips any order that has ever been synced, so
+# a row first seen mid-flight keeps that state forever: 2607000117240493 and
+# 2607000118620451 sat at "Provisioning" from 18 Aug because every nightly run
+# skipped them. Deliberately a short allowlist -- an unknown state re-checks,
+# which costs a fetch, while wrongly calling something terminal loses the
+# update entirely.
+TERMINAL_ORDER_STATES = ("completed", "cancelled", "canceled", "void")
+
+
+def _is_terminal_state(state: str) -> bool:
+    s = (state or "").strip().lower()
+    return any(t in s for t in TERMINAL_ORDER_STATES)
+
 # Cell positions used when the header row cannot be read. These are the
 # long-standing History positions.
 FALLBACK_COLS = {
@@ -487,22 +504,25 @@ async def click_and_select_all_agents(page) -> int:
 
 async def check_existing_orders_with_dates(
     ws,
-) -> Tuple[Dict[str, datetime], Dict[str, int], set]:
+) -> Tuple[Dict[str, datetime], Dict[str, int], set, set]:
     """
     Check Google Sheet for existing orders, their dates, and MISSING DATA.
     Returns:
         - complete_orders: {order_id: last_synced_datetime}
         - incomplete_orders: {order_id: row_index}
         - orders_missing_org: set(order_ids) -> IDs that have Last Synced but no Org Code
+        - orders_unsettled: set(order_ids) -> synced, but still in a non-terminal
+          state, so their stored status is stale and must be re-fetched
     """
     complete_orders = {}
     incomplete_orders = {}
     orders_missing_org = set()
+    orders_unsettled = set()
 
     try:
         records = ws.get_all_values()
         if not records:
-            return {}, {}, set()
+            return {}, {}, set(), set()
 
         headers = records[0]
         print(f"  📊 Checking {len(records)-1} existing orders...")
@@ -512,6 +532,11 @@ async def check_existing_orders_with_dates(
             org_code_idx = headers.index("Org Code")
         except ValueError:
             org_code_idx = -1  # Column not found
+
+        try:
+            status_idx = headers.index("Order Status")
+        except ValueError:
+            status_idx = -1
 
         for idx, row in enumerate(records[1:], start=2):
             if not row or len(row) == 0:
@@ -545,14 +570,26 @@ async def check_existing_orders_with_dates(
                 # If it's synced but missing Org Code, mark for rescrape
                 if not has_org_code:
                     orders_missing_org.add(order_number)
+
+                # Synced while still in flight -- the stored status is a
+                # snapshot, not a conclusion, so it has to be looked at again.
+                if status_idx != -1:
+                    stored = row[status_idx] if len(row) > status_idx else ""
+                    if not _is_terminal_state(stored):
+                        orders_unsettled.add(order_number)
             else:
                 incomplete_orders[order_number] = idx
 
-        return complete_orders, incomplete_orders, orders_missing_org
+        return (
+            complete_orders,
+            incomplete_orders,
+            orders_missing_org,
+            orders_unsettled,
+        )
 
     except Exception as e:
         print(f"⚠️ Error checking orders: {e}")
-        return {}, {}, set()
+        return {}, {}, set(), set()
 
 
 def should_rescrape_order(
@@ -758,9 +795,12 @@ async def scrape_orders_month(
         # Get existing orders with their last synced dates
         if output_format == "sheets":
             print("\n🔍 Checking existing data with date comparison...")
-            complete_orders, incomplete_orders, orders_missing_org = (
-                await check_existing_orders_with_dates(ws)
-            )
+            (
+                complete_orders,
+                incomplete_orders,
+                orders_missing_org,
+                orders_unsettled,
+            ) = await check_existing_orders_with_dates(ws)
 
             if complete_orders:
                 print(f"  ✅ {len(complete_orders)} orders with sync dates")
@@ -768,12 +808,23 @@ async def scrape_orders_month(
                 print(
                     f"  ⚠️ {len(orders_missing_org)} orders missing Org Code (will rescrape)"
                 )
+            if orders_unsettled:
+                print(
+                    f"  ⏳ {len(orders_unsettled)} orders still in a non-terminal "
+                    f"state (will rescrape to refresh status)"
+                )
             if incomplete_orders:
                 print(f"  🔄 {len(incomplete_orders)} incomplete orders")
         else:
             # CSV mode: Use checkpoint
             complete_orders = {}
             incomplete_orders = {}
+            # Both are only populated from a sheet, but the skip check below
+            # reads them on every path -- orders_missing_org was previously
+            # left undefined here, which would raise NameError on the first
+            # already-synced order in a CSV run.
+            orders_missing_org = set()
+            orders_unsettled = set()
 
             if os.path.exists(checkpoint_file):
                 try:
@@ -1028,8 +1079,16 @@ async def scrape_orders_month(
                             should_skip = False
 
                             if order_id in complete_orders:
+                                # An order still in flight must be refreshed:
+                                # its stored status is a snapshot, not a result.
+                                if order_id in orders_unsettled:
+                                    should_skip = False
+                                    print(
+                                        f"  [{row_idx}/{len(order_rows)}] {order_id} "
+                                        f"⏳ (refreshing non-terminal status)"
+                                    )
                                 # CHECK: Is it one of the broken ones missing Org Code?
-                                if order_id in orders_missing_org:
+                                elif order_id in orders_missing_org:
                                     should_skip = False
                                     print(
                                         f"  [{row_idx}/{len(order_rows)}] {order_id} 🛠️ (rescraping missing Org Code)"
